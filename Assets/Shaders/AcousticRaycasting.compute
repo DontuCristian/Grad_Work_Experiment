@@ -1,0 +1,301 @@
+#pragma kernel CSMain
+
+// ---------- Structs ----------
+struct Triangle
+{
+    float3 v0;
+    float3 v1;
+    float3 v2;
+};
+
+struct BVHNode
+{
+    float3 boundsMin;
+    float3 boundsMax;
+    int leftChild;
+    int rightChild;
+    int firstTriangle;
+    int triangleCount;
+};
+
+
+// ---------- Buffers ----------
+StructuredBuffer<Triangle> _Triangles; // geometry
+StructuredBuffer<BVHNode> _BVHNodes; // BVH nodes
+RWStructuredBuffer<uint> _IRBins; // impulse response bins
+RWStructuredBuffer<uint> _DebugCounters;
+StructuredBuffer<int> _TriangleIndices; // triangle indices per leaf
+
+// ---------- Constants ----------
+int _NumRays;
+float _SpeedOfSound;
+int _IRBinCount;
+float _BinSizeMs;
+int _MaxBounces;
+
+float3 _SourcePos;
+int _FrameIndex;
+
+float3 _ListenerPos;
+float _ListenerRadius;
+
+// ---------- Simple RNG ----------
+uint Hash(uint x)
+{
+    x ^= x >> 17;
+    x *= 0xed5ad4bbU;
+    x ^= x >> 11;
+    x *= 0xac4c1b51U;
+    x ^= x >> 15;
+    x *= 0x31848babU;
+    x ^= x >> 14;
+    return x;
+}
+
+// Sample random direction on a sphere
+float3 SampleDirection(uint rayIndex, int frameIdx)
+{
+    uint seed = Hash(rayIndex + frameIdx * 73856093u);
+    float u = (seed & 0xFFFF) / 65535.0;
+    float v = ((seed >> 16) & 0xFFFF) / 65535.0;
+
+    float phi = 2.0 * 3.14159265 * u;
+    float cosTheta = 2.0 * v - 1.0;
+    float sinTheta = sqrt(1.0 - cosTheta * cosTheta);
+
+    float3 dir = float3(cos(phi) * sinTheta, cosTheta, sin(phi) * sinTheta);
+    return normalize(dir);
+}
+
+// Ray-triangle intersection (Moller-Trumbore)
+bool RayTriangleIntersect(float3 orig, float3 dir, Triangle tri, out float t)
+{
+    const float EPS = 1e-5;
+    float3 v0v1 = tri.v1 - tri.v0;
+    float3 v0v2 = tri.v2 - tri.v0;
+    float3 pvec = cross(dir, v0v2);
+    float det = dot(v0v1, pvec);
+
+    if (abs(det) < EPS)
+    {
+        t = 0;
+        return false;
+    }
+
+    float invDet = 1.0 / det;
+    float3 tvec = orig - tri.v0;
+    float u = dot(tvec, pvec) * invDet;
+    if (u < 0.0 || u > 1.0)
+    {
+        t = 0;
+        return false;
+    }
+
+    float3 qvec = cross(tvec, v0v1);
+    float v = dot(qvec, dir) * invDet;
+    if (v < 0.0 || u + v > 1.0)
+    {
+        t = 0;
+        return false;
+    }
+
+    t = dot(v0v2, qvec) * invDet;
+    return t > EPS;
+}
+
+// AABB -ray intersection
+bool RayAABB(float3 origin, float3 invDir, float3 bmin, float3 bmax, float tMax)
+{
+    float3 t1 = (bmin - origin) * invDir;
+    float3 t2 = (bmax - origin) * invDir;
+
+    float3 tmin3 = min(t1, t2);
+    float3 tmax3 = max(t1, t2);
+
+    float tmin = max(max(tmin3.x, tmin3.y), tmin3.z);
+    float tmax = min(min(tmax3.x, tmax3.y), tmax3.z);
+
+    return tmax >= max(0.0, tmin) && tmin <= tMax;
+}
+
+// BVH Traversal
+bool IntersectBVH(float3 origin, float3 dir, out float hitT,out float3 hitNormal)
+{
+    hitT = 1e20;
+    bool hit = false;
+
+    float3 invDir = 1.0 / max(abs(dir), 1e-6) * sign(dir);
+
+    // Fixed-size stack (depth of about 64 should be safe in our case)
+    int stack[64];
+    int stackPtr = 0;
+
+    // Push root
+    stack[stackPtr++] = 0;
+
+    while (stackPtr > 0)
+    {
+        int nodeIndex = stack[--stackPtr];
+        BVHNode node = _BVHNodes[nodeIndex];
+
+        if (!RayAABB(origin, invDir, node.boundsMin, node.boundsMax, hitT))
+            continue;
+
+        if (node.triangleCount > 0)
+        {
+            // Leaf
+            for (int i = 0; i < node.triangleCount; i++)
+            {
+                int triIndex = _TriangleIndices[node.firstTriangle + i];
+                Triangle tri = _Triangles[triIndex];
+
+                float t;
+                if (RayTriangleIntersect(origin, dir, tri, t) && t < hitT)
+                {
+                    hitT = t;
+                    hit = true;
+                    
+                    float3 e1 = tri.v1 - tri.v0;
+                    float3 e2 = tri.v2 - tri.v0;
+                    hitNormal = normalize(cross(e1, e2));
+                    
+                    if (dot(hitNormal, dir) > 0)
+                        hitNormal = -hitNormal;
+                }
+            }
+        }
+        else
+        {
+            // Internal node -> push children
+            stack[stackPtr++] = node.leftChild;
+            stack[stackPtr++] = node.rightChild;
+        }
+    }
+
+    return hit;
+}
+
+// Listener intersection (sphere)
+bool RaySphereIntersect(float3 ro, float3 rd, float3 center, float radius, float tMax, out float tHit)
+{
+    float3 oc = ro - center;
+    float b = dot(oc, rd);
+    float c = dot(oc, oc) - radius * radius;
+    float h = b * b - c;
+
+    if (h < 0.0)
+    {
+        tHit = 0.0;
+        return false;
+    }
+
+    h = sqrt(h);
+    float t = -b - h;
+
+    if (t > 0.0 && t < tMax)
+    {
+        tHit = t;
+        return true;
+    }
+
+    tHit = 0.0;
+    return false;
+}
+
+bool VisibleToListener(float3 hitPos)
+{
+    float3 toListener = _ListenerPos - hitPos;
+    float dist = length(toListener);
+    float3 dir = toListener / dist;
+
+    float t;
+    float3 n;
+
+    // Shadow ray: is anything between hitPos and listener?
+    bool blocked = IntersectBVH(
+        hitPos + dir * 1e-4, // epsilon offset
+        dir,
+        t,
+        n
+    );
+
+    return !(blocked && t < dist);
+}
+
+// ---------- Compute Shader Main ----------
+[numthreads(64, 1, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+    uint rayIndex = id.x;
+    if (rayIndex >= _NumRays)
+        return;
+
+    float3 pos = _SourcePos;
+    float3 dir = SampleDirection(rayIndex, _FrameIndex);
+
+    float energy = 1.0;
+    float totalDistance = 0.0;
+
+    for (int bounce = 0; bounce < _MaxBounces; bounce++)
+    {
+        float hitT;
+        float3 hitNormal;
+
+        // --- Intersect scene ---
+        bool hitScene = IntersectBVH(pos, dir, hitT, hitNormal);
+
+        // --- Check listener FIRST ---
+        float listenerT;
+        bool hitListener = RaySphereIntersect(pos, dir, _ListenerPos, _ListenerRadius, hitScene ? hitT : 1e20, listenerT);
+
+        if (hitListener)
+        {
+            float3 hitPos = pos + dir * listenerT;
+            totalDistance += listenerT;
+
+            float timeMs = (totalDistance / _SpeedOfSound) * 1000.0;
+            int bin = (int) (timeMs / _BinSizeMs);
+
+            if (bin >= 0 && bin < _IRBinCount)
+            {
+                uint scaled = (uint) (energy * 1e6);
+                InterlockedAdd(_IRBins[bin], scaled);
+            }
+
+            InterlockedAdd(_DebugCounters[0], 1);
+            return;
+        }
+
+        if (hitScene)
+        {
+            InterlockedAdd(_DebugCounters[1], 1);
+        }
+        else
+        {
+            InterlockedAdd(_DebugCounters[2], 1);
+            return;
+        }
+
+        if (bounce >= 1)
+        {
+            InterlockedAdd(_DebugCounters[3], 1);
+        }
+
+        // --- Advance to surface ---
+        totalDistance += hitT;
+
+        // Distance attenuation
+        energy *= 1.0 / (hitT * hitT + 1.0);
+
+        // Absorption
+        energy *= 0.97;
+
+        if (energy < 1e-4)
+            return;
+
+        // Reflect
+        pos = pos + dir * hitT + hitNormal * 1e-4;
+        dir = reflect(dir, hitNormal);
+        
+    }
+}
